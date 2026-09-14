@@ -15,6 +15,23 @@ struct BaseType {
      * @brief Timestamp of published message in microseconds.
      */
     uint64_t timestamp_us{0};
+
+    /**
+     * @brief Returns a compile-time identifier for the message type (64-bit FNV-1a).
+     *
+     * @tparam T IPC message type.
+     * @return 64-bit type identifier.
+     */
+    template <typename T>
+    static constexpr uint64_t typeId() {
+        constexpr std::string_view name = __PRETTY_FUNCTION__;
+        uint64_t hash = 14695981039346656037ULL;
+        for (const char c : name) {
+            hash ^= static_cast<uint64_t>(c);
+            hash *= 1099511628211ULL;
+        }
+        return hash;
+    }
 };
 
 

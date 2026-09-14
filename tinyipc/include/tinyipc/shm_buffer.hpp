@@ -40,6 +40,14 @@ struct BufferHeader {
      * buffer is created and is read by subscribers.
      */
     std::size_t buffer_size{0};
+
+    /**
+     * @brief Message ID.
+     *
+     * This value is initialized by the publisher when the shared-memory
+     * buffer is created and is read by subscribers.
+     */
+    uint64_t id_msg{0};
 };
 
 
