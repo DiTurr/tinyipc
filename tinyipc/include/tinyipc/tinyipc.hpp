@@ -117,24 +117,21 @@ public:
     }
 
     /**
-     * @brief Publishes data to buffer.
-     *
-     *   Before publish:
-     *       header.sequence = N
-     *       slot.sequence   = N
-     *
-     *   Start writing:
-     *       slot.sequence   = N + 1   ← invalidate slot
-     *
-     *   Write:
-     *       slot.data = value
-     *
-     *   Publish:
-     *       header.sequence = N + 1   ← subscriber is notified
-     *
-     * @param value Data to publish.
-     */
-    void publish(const T& value) {
+    * @brief Prepares the next buffer slot for writing.
+    *
+    *   Before prepare:
+    *       header.sequence = N
+    *       slot.sequence   = N
+    *
+    *   Start writing:
+    *       slot.sequence   = N + 1   ← invalidate slot
+    *
+    *   After prepare:
+    *       The returned slot can be modified directly.
+    *
+    * @return Reference to the data in the next buffer slot.
+    */
+    T& prepare() {
         const uint32_t sequence = buffer_->header.sequence.load(std::memory_order_acquire);
         const std::size_t idx_slot = sequence % BufferSize;
         // Update sequence in the slot --> fixed data validity in reference to subscribers notification
@@ -144,11 +141,39 @@ public:
         buffer_->slot[idx_slot].timestamp_us =
             std::chrono::duration_cast<std::chrono::microseconds>(
                 std::chrono::steady_clock::now().time_since_epoch()).count();
-        // Update data in the slot
-        buffer_->slot[idx_slot].data = value;
-        // Update sequence in the header --> subscribers notified
+        // Return reference to slot
+        return buffer_->slot[idx_slot].data;
+    }
+
+    /**
+    * @brief Commits the prepared buffer slot.
+    *
+    *   Before commit:
+    *       header.sequence = N
+    *       slot.sequence   = N + 1   ← data is being written
+    *
+    *   Publish:
+    *       header.sequence = N + 1   ← subscribers notified
+    */
+    void commit() {
+        // Update sequence in the header --> subscribers notified.
         buffer_->header.sequence.fetch_add(1, std::memory_order_release);
+        // Wake up subscribers
         wakeup();
+    }
+
+    /**
+    * @brief Publishes data to buffer.
+    *
+    * @param value Data to publish.
+    */
+    void publish(const T& value) {
+        // Prepare buffer slot
+        T& data = prepare();
+        // Copy data into the shared-memory slot.
+        data = value;
+        // Commit
+        commit();
     }
 
 private:
@@ -290,43 +315,54 @@ public:
     }
 
     /**
-     * @brief Waits for the next published value.
+     * @brief Waits for and retrieves the latest available data.
      *
-     * @return Newly published data.
+     * The method blocks until a new message is available. It uses the
+     * sequence number as the source of truth and a futex only for
+     * notification.
+     *
+     * If the subscriber falls behind and multiple messages are published
+     * before it wakes up, only the latest message is returned.
+     *
+     * The destination object is provided by the caller and reused between
+     * calls, avoiding the construction of a temporary T object for every
+     * received message.
+     *
+     * @param[out] value Object into which the received data is copied.
+     *
+     * @return True when a new message has been received.
      */
-    T wait() {
+    bool wait(T& value) {
         while (true) {
             const uint32_t sequence_header = header_->sequence.load(std::memory_order_acquire);
             if (sequence_header != sequence_) {
-                // Read slot sequence
-                // Write procedure from publisher:
-                //  - idx_slot = sequence % buffer_size
-                //  - Write to that slot index
-                //  - Increase sequence by 1 to wake up subscribers --> therefore (sequence_ - 1)
-                //    used to calculate slot index.
+                // Calculate the slot containing the latest message.
                 const std::size_t idx_slot = (sequence_header - 1) % buffer_size_;
+
+                // Read the slot sequence to verify that the slot contains the message referenced by the header.
                 const uint32_t sequence_slot = slot_[idx_slot].sequence.load(std::memory_order_acquire);
 
-                // The slot has already been overwritten by a newer
-                // message. Retry using the latest sequence number.
+                // The slot has already been overwritten by a newer message. Retry using the latest sequence number.
                 if (sequence_slot != sequence_header) {
                     sequence_ = sequence_header;
                     continue;
                 }
 
-                // Read data of the slot
-                T value = slot_[idx_slot].data;
+                // Copy the data from shared memory into the caller-provided object.
+                value = slot_[idx_slot].data;
 
-                // Check again after copying. If the sequence changed,
-                // the publisher overwrote the slot while it was being read.
+                // Check again after copying. If the publisher overwrote the slot while it was being read, retry.
                 if (slot_[idx_slot].sequence.load(std::memory_order_acquire) != sequence_slot) {
-                    sequence_ = header_->sequence.load(std::memory_order_acquire);
+                    sequence_ =header_->sequence.load(std::memory_order_acquire);
                     continue;
                 }
 
                 sequence_ = sequence_header;
-                return value;
+                return true;
             }
+
+            // No new message is available. Wait for the publisher
+            // to update the header sequence.
             wait_for_publish();
         }
     }
